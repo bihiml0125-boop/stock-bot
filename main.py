@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from urllib.parse import quote
+import xml.etree.ElementTree as ET
 from aiohttp import ClientSession, web
 from telegram import Update
 from telegram.ext import (
@@ -12,11 +13,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ======================= [ 발급 키 설정 ] =======================
+# ======================= [ 설정 영역 ] =======================
 TELEGRAM_BOT_TOKEN = "8730961288:AAGVNFJP4XV4f71ftC6A5yzJIIpaO8gdIdU"
-NAVER_CLIENT_ID = "qrTlfL1IhNvxcDsy6JMP"
-NAVER_CLIENT_SECRET = "p6kobEIYLf"
-
 CHECK_INTERVAL_SECONDS = 60
 # =============================================================
 
@@ -30,29 +28,44 @@ sent_links = set()
 
 def clean_html(raw_html: str) -> str:
     cleantext = re.sub(r"<.*?>", "", raw_html)
-    return html.unescape(cleantext)
+    return html.unescape(cleantext).strip()
 
 
 async def fetch_news(session: ClientSession, keyword: str):
-    # 한글 키워드 인코딩 처리
+    """구글 뉴스 RSS를 통해 국내 주요 언론사 실시간 기사 수집 (키 불필요)"""
     encoded_kw = quote(keyword.strip())
-    url = f"https://openapi.naver.com/v1/search/news.json?query={encoded_kw}&display=10&sort=date"
+    url = f"https://news.google.com/rss/search?q={encoded_kw}&hl=ko&gl=KR&ceid=KR:ko"
+
     headers = {
-        "X-Naver-Client-Id": NAVER_CLIENT_ID,
-        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
+    items = []
     try:
         async with session.get(url, headers=headers, timeout=10) as resp:
             if resp.status == 200:
-                data = await resp.json()
-                return data.get("items", []), None
+                xml_text = await resp.text()
+                root = ET.fromstring(xml_text)
+                channel = root.find("channel")
+                if channel is not None:
+                    for item in channel.findall("item")[:5]:
+                        title = item.find("title").text if item.find("title") is not None else ""
+                        link = item.find("link").text if item.find("link") is not None else ""
+                        desc = item.find("description").text if item.find("description") is not None else ""
+                        source = item.find("source").text if item.find("source") is not None else "주요 언론"
+
+                        if title and link:
+                            items.append({
+                                "title": title,
+                                "link": link,
+                                "description": desc,
+                                "source": source,
+                            })
+                return items, None
             else:
-                err_text = await resp.text()
-                logging.error(f"[{keyword}] 네이버 API 에러 ({resp.status}): {err_text}")
-                return [], f"API 에러코드 {resp.status}"
+                return [], f"HTTP {resp.status}"
     except Exception as e:
-        logging.error(f"[{keyword}] 통신 실패: {e}")
+        logging.error(f"[{keyword}] 뉴스 수집 실패: {e}")
         return [], str(e)
 
 
@@ -63,6 +76,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     guide_text = (
         "📈 <b>주식·시황 실시간 뉴스 알림봇</b>\n\n"
+        "국내 모든 언론사의 실시간 뉴스를 감시하여 전달합니다.\n\n"
         "<b>[명령어 안내]</b>\n"
         "• <code>/add [종목/키워드]</code> : 키워드 추가\n"
         "  (예: <code>/add 삼성전자</code>, <code>/add 코스피</code>)\n"
@@ -90,40 +104,33 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         items, err = await fetch_news(session, keyword)
 
-    # API 에러 발생 시 즉각 사용자에게 알림
     if err:
-        await update.message.reply_text(
-            f"❌ <b>네이버 API 호출 실패:</b> {err}\n\n"
-            f"네이버 개발자 센터에서 '검색' 서비스가 활성화되어 있는지 확인해 주세요.",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text(f"❌ 뉴스 수집 통신 오류: {err}", parse_mode="HTML")
         return
 
     user_keywords[chat_id].add(keyword)
-    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n새 뉴스가 나오면 실시간으로 전달합니다.", parse_mode="HTML")
+    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n지금부터 새 뉴스가 나오면 실시간으로 전달합니다.", parse_mode="HTML")
 
-    # 기존 최신 기사는 중복 전송 방지를 위해 기록하고, 가장 최근 기사 1개를 샘플로 즉시 전송
+    # 기존 등록되어 있던 기사는 중복 알림 방지용으로 기록
     latest_item = None
     for idx, item in enumerate(items):
-        link = item.get("originallink") or item.get("link")
-        if link:
-            sent_links.add(link)
-            if idx == 0:
-                latest_item = item
+        link = item["link"]
+        sent_links.add(link)
+        if idx == 0:
+            latest_item = item
 
+    # 등록 즉시 최근 기사 1건을 샘플로 발송
     if latest_item:
-        title = clean_html(latest_item.get("title", ""))
-        desc = clean_html(latest_item.get("description", ""))
-        link = latest_item.get("originallink") or latest_item.get("link")
+        title = clean_html(latest_item["title"])
+        source = latest_item.get("source", "언론사")
+        link = latest_item["link"]
         sample_msg = (
-            f"🔔 <b>[{keyword} 최신 기사 테스트]</b>\n\n"
+            f"🔔 <b>[{keyword} 최신 뉴스 확인]</b>\n\n"
             f"📰 <b>{title}</b>\n"
-            f"{desc[:90]}...\n\n"
+            f"출처: {source}\n\n"
             f"🔗 <a href='{link}'>기사 원문 보기</a>"
         )
         await update.message.reply_text(sample_msg, parse_mode="HTML")
-    else:
-        await update.message.reply_text(f"ℹ️ '{keyword}' 관련 현재 검색된 최근 뉴스가 없습니다.", parse_mode="HTML")
 
 
 async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,19 +174,17 @@ async def background_monitoring(app: Application):
                             items, _ = await fetch_news(session, kw)
 
                             for item in reversed(items):
-                                link = item.get("originallink") or item.get("link")
+                                link = item["link"]
                                 if not link or link in sent_links:
                                     continue
 
-                                title = clean_html(item.get("title", ""))
-                                desc = clean_html(item.get("description", ""))
-                                if len(desc) > 90:
-                                    desc = desc[:90] + "..."
+                                title = clean_html(item["title"])
+                                source = item.get("source", "언론사")
 
                                 message = (
                                     f"🚨 <b>[{kw} 새 뉴스 알림]</b>\n\n"
                                     f"📰 <b>{title}</b>\n"
-                                    f"{desc}\n\n"
+                                    f"출처: {source}\n\n"
                                     f"🔗 <a href='{link}'>기사 원문 보기</a>"
                                 )
 
@@ -209,7 +214,7 @@ async def background_monitoring(app: Application):
 
 
 async def handle_ping(request):
-    return web.Response(text="Stock Bot Live!")
+    return web.Response(text="Stock Bot Running!")
 
 
 async def run_web_server():
@@ -220,7 +225,6 @@ async def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"웹서버 구동 (Port {port})")
 
 
 async def post_init(application: Application):
