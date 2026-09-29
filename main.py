@@ -61,7 +61,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  (예: <code>/add 삼성전자</code>, <code>/add 코스피</code>)\n"
         "• <code>/del [종목/단어]</code> : 등록된 키워드 삭제\n"
         "• <code>/list</code> : 현재 감시 중인 키워드 목록\n"
-        "• <code>/help</code> : 도움말 다시 보기"
+        "• <code>/help</code> : 사용 안내"
     )
     await update.message.reply_text(guide_text, parse_mode="HTML")
 
@@ -117,70 +117,82 @@ async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📋 <b>감시 중인 키워드 ({len(keywords)}개):</b>\n\n{kw_list_str}", parse_mode="HTML")
 
 
-async def monitor_news_job(context: ContextTypes.DEFAULT_TYPE):
-    if not user_keywords:
-        return
+async def background_monitoring(app: Application):
+    """독립 실행되는 백그라운드 모니터링 루프"""
+    await asyncio.sleep(5)  # 봇 시작 후 대기
+    while True:
+        try:
+            if user_keywords:
+                all_unique_keywords = set()
+                for kw_set in user_keywords.values():
+                    all_unique_keywords.update(kw_set)
 
-    all_unique_keywords = set()
-    for kw_set in user_keywords.values():
-        all_unique_keywords.update(kw_set)
+                if all_unique_keywords:
+                    async with aiohttp.ClientSession() as session:
+                        for kw in all_unique_keywords:
+                            items = await fetch_news(session, kw)
 
-    if not all_unique_keywords:
-        return
+                            for item in reversed(items):
+                                link = item.get("originallink") or item.get("link")
+                                if not link or link in sent_links:
+                                    continue
 
-    async with aiohttp.ClientSession() as session:
-        for kw in all_unique_keywords:
-            items = await fetch_news(session, kw)
+                                title = clean_html(item.get("title", ""))
+                                desc = clean_html(item.get("description", ""))
+                                if len(desc) > 90:
+                                    desc = desc[:90] + "..."
 
-            for item in reversed(items):
-                link = item.get("originallink") or item.get("link")
-                if not link or link in sent_links:
-                    continue
+                                message = (
+                                    f"🚨 <b>[{kw} 기사 알림]</b>\n\n"
+                                    f"📰 <b>{title}</b>\n"
+                                    f"{desc}\n\n"
+                                    f"🔗 <a href='{link}'>기사 원문 보기</a>"
+                                )
 
-                title = clean_html(item.get("title", ""))
-                desc = clean_html(item.get("description", ""))
-                if len(desc) > 90:
-                    desc = desc[:90] + "..."
+                                for chat_id, kws in user_keywords.items():
+                                    if kw in kws:
+                                        try:
+                                            await app.bot.send_message(
+                                                chat_id=chat_id,
+                                                text=message,
+                                                parse_mode="HTML",
+                                                disable_web_page_preview=False,
+                                            )
+                                            await asyncio.sleep(0.1)
+                                        except Exception as e:
+                                            logging.error(f"메시지 발송 오류: {e}")
 
-                message = (
-                    f"🚨 <b>[{kw} 기사 알림]</b>\n\n"
-                    f"📰 <b>{title}</b>\n"
-                    f"{desc}\n\n"
-                    f"🔗 <a href='{link}'>기사 원문 보기</a>"
-                )
+                                sent_links.add(link)
 
-                for chat_id, kws in user_keywords.items():
-                    if kw in kws:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=message,
-                                parse_mode="HTML",
-                                disable_web_page_preview=False,
-                            )
-                            await asyncio.sleep(0.1)
-                        except Exception as e:
-                            logging.error(f"메시지 발송 오류: {e}")
+                            await asyncio.sleep(0.3)
 
-                sent_links.add(link)
+            if len(sent_links) > 3000:
+                sent_links.clear()
 
-            await asyncio.sleep(0.3)
+        except Exception as e:
+            logging.error(f"모니터링 오류: {e}")
 
-    if len(sent_links) > 3000:
-        sent_links.clear()
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+async def post_init(application: Application):
+    # 봇 초기화 완료 시 백그라운드 뉴스 감시 작업 시작
+    asyncio.create_task(background_monitoring(application))
 
 
 def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("add", add_keyword))
     application.add_handler(CommandHandler("del", remove_keyword))
     application.add_handler(CommandHandler("list", list_keywords))
-
-    job_queue = application.job_queue
-    job_queue.run_repeating(monitor_news_job, interval=CHECK_INTERVAL_SECONDS, first=10)
 
     print("🚀 봇이 정상 실행되었습니다.")
     application.run_polling()
