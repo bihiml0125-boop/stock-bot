@@ -1,8 +1,9 @@
 import asyncio
 import html
 import logging
+import os
 import re
-import aiohttp
+from aiohttp import ClientSession, web
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,13 +11,11 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ======================= [ 설정 영역 ] =======================
 TELEGRAM_BOT_TOKEN = "8730961288:AAGVNFJP4XV4f71ftC6A5yzJIIpaO8gdIdU"
 NAVER_CLIENT_ID = "qrTlfL1IhNvxcDsy6JMP"
 NAVER_CLIENT_SECRET = "p6kobEIYLf"
 
 CHECK_INTERVAL_SECONDS = 60
-# =============================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -31,7 +30,7 @@ def clean_html(raw_html: str) -> str:
     return html.unescape(cleantext)
 
 
-async def fetch_news(session: aiohttp.ClientSession, keyword: str):
+async def fetch_news(session: ClientSession, keyword: str):
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {
         "X-Naver-Client-Id": NAVER_CLIENT_ID,
@@ -44,8 +43,10 @@ async def fetch_news(session: aiohttp.ClientSession, keyword: str):
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("items", [])
+            else:
+                logging.error(f"[{keyword}] 네이버 API 오류 코드: {resp.status}")
     except Exception as e:
-        logging.error(f"[{keyword}] 뉴스 수집 에러: {e}")
+        logging.error(f"[{keyword}] 뉴스 수집 실패: {e}")
     return []
 
 
@@ -80,15 +81,32 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ '<b>{keyword}</b>'은(는) 이미 등록되어 있습니다.", parse_mode="HTML")
         return
 
-    async with aiohttp.ClientSession() as session:
+    async with ClientSession() as session:
         items = await fetch_news(session, keyword)
-        for item in items:
+        # 최초 등록 시 최신 1개 기사를 즉시 발송하여 동작 확인
+        latest_item = None
+        for idx, item in enumerate(items):
             link = item.get("originallink") or item.get("link")
             if link:
                 sent_links.add(link)
+                if idx == 0:
+                    latest_item = item
 
     user_keywords[chat_id].add(keyword)
-    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n새 뉴스가 나오면 실시간으로 전달합니다.", parse_mode="HTML")
+    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n지금부터 새 뉴스가 감지되면 실시간 전달합니다.", parse_mode="HTML")
+
+    # 등록 확인용 최신 뉴스 1건 샘플 발송
+    if latest_item:
+        title = clean_html(latest_item.get("title", ""))
+        desc = clean_html(latest_item.get("description", ""))
+        link = latest_item.get("originallink") or latest_item.get("link")
+        sample_msg = (
+            f"🔔 <b>[{keyword} 최신 뉴스 확인]</b>\n\n"
+            f"📰 <b>{title}</b>\n"
+            f"{desc[:90]}...\n\n"
+            f"🔗 <a href='{link}'>기사 원문 보기</a>"
+        )
+        await update.message.reply_text(sample_msg, parse_mode="HTML")
 
 
 async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -118,8 +136,7 @@ async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def background_monitoring(app: Application):
-    """독립 실행되는 백그라운드 모니터링 루프"""
-    await asyncio.sleep(5)  # 봇 시작 후 대기
+    await asyncio.sleep(5)
     while True:
         try:
             if user_keywords:
@@ -128,7 +145,8 @@ async def background_monitoring(app: Application):
                     all_unique_keywords.update(kw_set)
 
                 if all_unique_keywords:
-                    async with aiohttp.ClientSession() as session:
+                    logging.info(f"뉴스 수집 주기 실행 중: {list(all_unique_keywords)}")
+                    async with ClientSession() as session:
                         for kw in all_unique_keywords:
                             items = await fetch_news(session, kw)
 
@@ -143,7 +161,7 @@ async def background_monitoring(app: Application):
                                     desc = desc[:90] + "..."
 
                                 message = (
-                                    f"🚨 <b>[{kw} 기사 알림]</b>\n\n"
+                                    f"🚨 <b>[{kw} 새 뉴스 알림]</b>\n\n"
                                     f"📰 <b>{title}</b>\n"
                                     f"{desc}\n\n"
                                     f"🔗 <a href='{link}'>기사 원문 보기</a>"
@@ -156,7 +174,6 @@ async def background_monitoring(app: Application):
                                                 chat_id=chat_id,
                                                 text=message,
                                                 parse_mode="HTML",
-                                                disable_web_page_preview=False,
                                             )
                                             await asyncio.sleep(0.1)
                                         except Exception as e:
@@ -175,9 +192,24 @@ async def background_monitoring(app: Application):
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
+async def handle_ping(request):
+    return web.Response(text="Stock Bot is Running!")
+
+
+async def run_web_server():
+    server = web.Application()
+    server.router.add_get("/", handle_ping)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Render 헬스체크 웹서버 시작됨 (포트: {port})")
+
+
 async def post_init(application: Application):
-    # 봇 초기화 완료 시 백그라운드 뉴스 감시 작업 시작
     asyncio.create_task(background_monitoring(application))
+    asyncio.create_task(run_web_server())
 
 
 def main():
