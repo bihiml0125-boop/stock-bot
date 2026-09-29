@@ -3,6 +3,7 @@ import html
 import logging
 import os
 import re
+from urllib.parse import quote
 from aiohttp import ClientSession, web
 from telegram import Update
 from telegram.ext import (
@@ -11,11 +12,13 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# ======================= [ 발급 키 설정 ] =======================
 TELEGRAM_BOT_TOKEN = "8730961288:AAGVNFJP4XV4f71ftC6A5yzJIIpaO8gdIdU"
 NAVER_CLIENT_ID = "qrTlfL1IhNvxcDsy6JMP"
 NAVER_CLIENT_SECRET = "p6kobEIYLf"
 
 CHECK_INTERVAL_SECONDS = 60
+# =============================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -31,23 +34,26 @@ def clean_html(raw_html: str) -> str:
 
 
 async def fetch_news(session: ClientSession, keyword: str):
-    url = "https://openapi.naver.com/v1/search/news.json"
+    # 한글 키워드 인코딩 처리
+    encoded_kw = quote(keyword.strip())
+    url = f"https://openapi.naver.com/v1/search/news.json?query={encoded_kw}&display=10&sort=date"
     headers = {
         "X-Naver-Client-Id": NAVER_CLIENT_ID,
         "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
     }
-    params = {"query": keyword, "display": 5, "sort": "date"}
 
     try:
-        async with session.get(url, headers=headers, params=params, timeout=10) as resp:
+        async with session.get(url, headers=headers, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return data.get("items", [])
+                return data.get("items", []), None
             else:
-                logging.error(f"[{keyword}] 네이버 API 오류 코드: {resp.status}")
+                err_text = await resp.text()
+                logging.error(f"[{keyword}] 네이버 API 에러 ({resp.status}): {err_text}")
+                return [], f"API 에러코드 {resp.status}"
     except Exception as e:
-        logging.error(f"[{keyword}] 뉴스 수집 실패: {e}")
-    return []
+        logging.error(f"[{keyword}] 통신 실패: {e}")
+        return [], str(e)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -58,9 +64,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     guide_text = (
         "📈 <b>주식·시황 실시간 뉴스 알림봇</b>\n\n"
         "<b>[명령어 안내]</b>\n"
-        "• <code>/add [종목/단어]</code> : 키워드 추가\n"
+        "• <code>/add [종목/키워드]</code> : 키워드 추가\n"
         "  (예: <code>/add 삼성전자</code>, <code>/add 코스피</code>)\n"
-        "• <code>/del [종목/단어]</code> : 등록된 키워드 삭제\n"
+        "• <code>/del [단어]</code> : 등록된 키워드 삭제\n"
         "• <code>/list</code> : 현재 감시 중인 키워드 목록\n"
         "• <code>/help</code> : 사용 안내"
     )
@@ -82,31 +88,42 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with ClientSession() as session:
-        items = await fetch_news(session, keyword)
-        # 최초 등록 시 최신 1개 기사를 즉시 발송하여 동작 확인
-        latest_item = None
-        for idx, item in enumerate(items):
-            link = item.get("originallink") or item.get("link")
-            if link:
-                sent_links.add(link)
-                if idx == 0:
-                    latest_item = item
+        items, err = await fetch_news(session, keyword)
+
+    # API 에러 발생 시 즉각 사용자에게 알림
+    if err:
+        await update.message.reply_text(
+            f"❌ <b>네이버 API 호출 실패:</b> {err}\n\n"
+            f"네이버 개발자 센터에서 '검색' 서비스가 활성화되어 있는지 확인해 주세요.",
+            parse_mode="HTML",
+        )
+        return
 
     user_keywords[chat_id].add(keyword)
-    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n지금부터 새 뉴스가 감지되면 실시간 전달합니다.", parse_mode="HTML")
+    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n새 뉴스가 나오면 실시간으로 전달합니다.", parse_mode="HTML")
 
-    # 등록 확인용 최신 뉴스 1건 샘플 발송
+    # 기존 최신 기사는 중복 전송 방지를 위해 기록하고, 가장 최근 기사 1개를 샘플로 즉시 전송
+    latest_item = None
+    for idx, item in enumerate(items):
+        link = item.get("originallink") or item.get("link")
+        if link:
+            sent_links.add(link)
+            if idx == 0:
+                latest_item = item
+
     if latest_item:
         title = clean_html(latest_item.get("title", ""))
         desc = clean_html(latest_item.get("description", ""))
         link = latest_item.get("originallink") or latest_item.get("link")
         sample_msg = (
-            f"🔔 <b>[{keyword} 최신 뉴스 확인]</b>\n\n"
+            f"🔔 <b>[{keyword} 최신 기사 테스트]</b>\n\n"
             f"📰 <b>{title}</b>\n"
             f"{desc[:90]}...\n\n"
             f"🔗 <a href='{link}'>기사 원문 보기</a>"
         )
         await update.message.reply_text(sample_msg, parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"ℹ️ '{keyword}' 관련 현재 검색된 최근 뉴스가 없습니다.", parse_mode="HTML")
 
 
 async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,10 +162,9 @@ async def background_monitoring(app: Application):
                     all_unique_keywords.update(kw_set)
 
                 if all_unique_keywords:
-                    logging.info(f"뉴스 수집 주기 실행 중: {list(all_unique_keywords)}")
                     async with ClientSession() as session:
                         for kw in all_unique_keywords:
-                            items = await fetch_news(session, kw)
+                            items, _ = await fetch_news(session, kw)
 
                             for item in reversed(items):
                                 link = item.get("originallink") or item.get("link")
@@ -177,7 +193,7 @@ async def background_monitoring(app: Application):
                                             )
                                             await asyncio.sleep(0.1)
                                         except Exception as e:
-                                            logging.error(f"메시지 발송 오류: {e}")
+                                            logging.error(f"전송 실패: {e}")
 
                                 sent_links.add(link)
 
@@ -193,7 +209,7 @@ async def background_monitoring(app: Application):
 
 
 async def handle_ping(request):
-    return web.Response(text="Stock Bot is Running!")
+    return web.Response(text="Stock Bot Live!")
 
 
 async def run_web_server():
@@ -204,7 +220,7 @@ async def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"Render 헬스체크 웹서버 시작됨 (포트: {port})")
+    logging.info(f"웹서버 구동 (Port {port})")
 
 
 async def post_init(application: Application):
