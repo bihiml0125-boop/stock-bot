@@ -6,7 +6,7 @@ import re
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
 from aiohttp import ClientSession, web
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,7 +32,7 @@ def clean_html(raw_html: str) -> str:
 
 
 async def fetch_news(session: ClientSession, keyword: str):
-    """구글 뉴스 RSS를 통해 국내 주요 언론사 실시간 기사 수집 (키 불필요)"""
+    """구글 뉴스 RSS를 통해 실시간 기사 수집"""
     encoded_kw = quote(keyword.strip())
     url = f"https://news.google.com/rss/search?q={encoded_kw}&hl=ko&gl=KR&ceid=KR:ko"
 
@@ -76,7 +76,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     guide_text = (
         "📈 <b>주식·시황 실시간 뉴스 알림봇</b>\n\n"
-        "국내 모든 언론사의 실시간 뉴스를 감시하여 전달합니다.\n\n"
         "<b>[명령어 안내]</b>\n"
         "• <code>/add [종목/키워드]</code> : 키워드 추가\n"
         "  (예: <code>/add 삼성전자</code>, <code>/add 코스피</code>)\n"
@@ -109,9 +108,9 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_keywords[chat_id].add(keyword)
-    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n지금부터 새 뉴스가 나오면 실시간으로 전달합니다.", parse_mode="HTML")
+    await update.message.reply_text(f"✅ '<b>{keyword}</b>' 등록 완료!\n새 뉴스가 나오면 실시간으로 전달합니다.", parse_mode="HTML")
 
-    # 기존 등록되어 있던 기사는 중복 알림 방지용으로 기록
+    # 기존 최신 기사는 중복 알림 방지용으로 기록
     latest_item = None
     for idx, item in enumerate(items):
         link = item["link"]
@@ -119,18 +118,19 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx == 0:
             latest_item = item
 
-    # 등록 즉시 최근 기사 1건을 샘플로 발송
+    # 등록 즉시 최근 기사 1건을 샘플로 발송 (원클릭 버튼 적용)
     if latest_item:
         title = clean_html(latest_item["title"])
         source = latest_item.get("source", "언론사")
         link = latest_item["link"]
+
         sample_msg = (
             f"🔔 <b>[{keyword} 최신 뉴스 확인]</b>\n\n"
-            f"📰 <b>{title}</b>\n"
-            f"출처: {source}\n\n"
-            f"🔗 <a href='{link}'>기사 원문 보기</a>"
+            f"📰 {title}\n"
+            f"출처: {source}"
         )
-        await update.message.reply_text(sample_msg, parse_mode="HTML")
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("기사 원문 보기 ↗", url=link)]])
+        await update.message.reply_text(sample_msg, parse_mode="HTML", reply_markup=reply_markup)
 
 
 async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,10 +183,12 @@ async def background_monitoring(app: Application):
 
                                 message = (
                                     f"🚨 <b>[{kw} 새 뉴스 알림]</b>\n\n"
-                                    f"📰 <b>{title}</b>\n"
-                                    f"출처: {source}\n\n"
-                                    f"🔗 <a href='{link}'>기사 원문 보기</a>"
+                                    f"📰 {title}\n"
+                                    f"출처: {source}"
                                 )
+
+                                # 원클릭 바로가기 버튼 생성
+                                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("기사 원문 보기 ↗", url=link)]])
 
                                 for chat_id, kws in user_keywords.items():
                                     if kw in kws:
@@ -195,6 +197,7 @@ async def background_monitoring(app: Application):
                                                 chat_id=chat_id,
                                                 text=message,
                                                 parse_mode="HTML",
+                                                reply_markup=reply_markup,
                                             )
                                             await asyncio.sleep(0.1)
                                         except Exception as e:
